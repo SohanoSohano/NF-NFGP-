@@ -6,6 +6,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 // import AdvisorChat from "@/components/advisor-chat";
 import RagAdvisorSection from "@/components/advisor-chat"; // Assuming this is the correct name now
 import EvolverSection from "@/components/evolver-section";
+import HybridEvolverSection from "@/components/hybrid-evolver-section";
 import GeminiChatSection from "@/components/gemini-chat-section";
 
 export default function Home() {
@@ -29,9 +30,10 @@ export default function Home() {
 
       {/* Tabs Component */}
       <Tabs defaultValue="evolver" className="w-full max-w-5xl"> {/* Increased max-width slightly */}
-        <TabsList className="grid w-full grid-cols-3">
+        <TabsList className="grid w-full grid-cols-4">
           <TabsTrigger value="advisor">RAG Advisor</TabsTrigger>
           <TabsTrigger value="evolver">CNN/RNN Evolver</TabsTrigger>
+          <TabsTrigger value="hybrid">Hybrid Neuro-Fuzzy</TabsTrigger>
           <TabsTrigger value="gemini_chat">Direct Chat</TabsTrigger>
         </TabsList>
 
@@ -43,6 +45,9 @@ export default function Home() {
         </TabsContent>
         <TabsContent value="evolver" className="mt-4">
           <EvolverSection />
+        </TabsContent>
+        <TabsContent value="hybrid" className="mt-4">
+          <HybridEvolverSection />
         </TabsContent>
         <TabsContent value="gemini_chat" className="mt-4">
            <GeminiChatSection />

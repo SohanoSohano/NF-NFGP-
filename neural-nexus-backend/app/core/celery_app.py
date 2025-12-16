@@ -6,7 +6,11 @@ celery_app = Celery(
     "neural_nexus_worker",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=['tasks.evolution_tasks'] # Make sure your task module is included
+    include=[
+        'tasks.evolution_tasks',
+        'tasks.hybrid_evolution_tasks',  # Hybrid neuro-fuzzy evolution
+        'tasks.rag_tasks'
+    ]
 )
 
 # --- ADD/MODIFY these settings ---

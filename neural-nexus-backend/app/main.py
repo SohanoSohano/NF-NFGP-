@@ -8,6 +8,7 @@ from app.api.endpoints import evolver # Evolver router
 from app.api.endpoints import advisor as advisor_router_module # Advisor router
 from app.api.endpoints.analysis import router as analysis_router # NEW: Analysis router
 from app.api.endpoints import gemini as gemini_router
+from app.api.endpoints import hybrid_evolver # Hybrid Neuro-Fuzzy Evolver
 # Import settings
 from app.core.config import settings
 import logging
@@ -75,6 +76,9 @@ logger.info("Included Analysis router at /api/v1/analysis") # Log inclusion
 # ----------------------------------
 app.include_router(gemini_router.router, prefix="/api/v1/gemini", tags=["Gemini Chat"])
 logger.info("Included Gemini Chat router at /api/v1/gemini")
+# --- Hybrid Neuro-Fuzzy Evolution Router ---
+app.include_router(hybrid_evolver.router, prefix="/api/v1/hybrid", tags=["Hybrid Evolution"])
+logger.info("Included Hybrid Evolution router at /api/v1/hybrid")
 
 # --- Root Endpoint ---
 @app.get("/")

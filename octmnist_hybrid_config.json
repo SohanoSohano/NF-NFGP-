@@ -1,0 +1,43 @@
+{
+  "generations": 20,
+  "population_size": 15,
+  "model_class": "OCTMNIST_CNN",
+  "model_args": [],
+  "model_kwargs": {
+    "input_channels": 1,
+    "num_classes": 4
+  },
+  "use_fuzzy": true,
+  "fuzzy_num_inputs": 2,
+  "fuzzy_num_outputs": 1,
+  "elitism_count": 2,
+  "tournament_size": 3,
+  "hyperparam_mutation_rate": 0.1,
+  "weight_mutation_rate": 0.1,
+  "fuzzy_mutation_rate": 0.05,
+  "hyperparam_mutation_strength": 0.02,
+  "weight_mutation_strength": 0.05,
+  "fuzzy_mutation_strength": 0.01,
+  "evolvable_hyperparams": {
+    "dropout_rate": {
+      "range": [0.1, 0.5],
+      "type": "float",
+      "description": "Dropout rate for regularization"
+    },
+    "conv1_filters": {
+      "range": [16, 64],
+      "type": "int",
+      "description": "Number of filters in first conv layer"
+    },
+    "conv2_filters": {
+      "range": [32, 128],
+      "type": "int",
+      "description": "Number of filters in second conv layer"
+    }
+  },
+  "eval_config": {
+    "dataset": "octmnist",
+    "batch_size": 256,
+    "device": "cuda"
+  }
+}
