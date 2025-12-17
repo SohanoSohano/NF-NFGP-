@@ -212,9 +212,9 @@ def load_task_eval_function(task_module_path: str) -> callable:
         logger.error(f"Error loading task evaluation function: {e}", exc_info=True)
         raise
 
-# MODIFIED: Handles hyperparameter evolution
+# MODIFIED: Handles hyperparameter evolution and fuzzy co-evolution
 def evaluate_population_step(
-    population: List[np.ndarray], # List of full chromosomes (hyperparams + weights)
+    population: List[np.ndarray], # List of full chromosomes (hyperparams + fuzzy_params + weights)
     model_definition_path: str,
     class_name: str,
     task_eval_func: callable,
@@ -223,7 +223,10 @@ def evaluate_population_step(
     model_kwargs_static: Dict[str, Any],
     eval_config: Dict[str, Any], # Passed from task
     num_hyperparams: int, # Number of hyperparameter genes
-    evolvable_hyperparams_config: Dict[str, Dict[str, Any]] # Config for decoding
+    evolvable_hyperparams_config: Dict[str, Dict[str, Any]], # Config for decoding
+    use_fuzzy: bool = False, # Whether to use fuzzy co-evolution
+    num_fuzzy_params: int = 0, # Number of fuzzy parameters
+    fuzzy_config: Dict[str, Any] = {} # Fuzzy configuration
 ) -> List[float]:
     """ Evaluates fitness, handling hyperparameter decoding and dynamic model instantiation. """
     fitness_scores = [-float('inf')] * len(population) # Initialize with failure sentinel
@@ -232,6 +235,13 @@ def evaluate_population_step(
     hyperparam_keys = list(evolvable_hyperparams_config.keys()) # Get keys for decoding
 
     logger.info(f"Evaluating {num_individuals} individuals with {num_hyperparams} hyperparameters...")
+    if use_fuzzy:
+        logger.info(f"Fuzzy co-evolution enabled with {num_fuzzy_params} fuzzy parameters")
+    
+    # Import fuzzy components if needed
+    if use_fuzzy:
+        from app.core.fuzzy import FuzzyInferenceSystem
+        from app.utils.fuzzy_helpers import decode_fuzzy_params
 
     # Pre-load the model CLASS definition once (reduces overhead in loop)
     # This part needs careful error handling as failure here affects all individuals
@@ -269,27 +279,98 @@ def evaluate_population_step(
             current_model = ModelClass(*model_args_static, **combined_kwargs)
             current_model.to(device)
 
-            # 3. Load Weights
-            if len(chromosome) > num_hyperparams:
-                weights_vector = chromosome[num_hyperparams:]
+            # 3. Extract fuzzy parameters (if enabled)
+            fuzzy_params = None
+            if use_fuzzy and num_fuzzy_params > 0:
+                fuzzy_start = num_hyperparams
+                fuzzy_end = fuzzy_start + num_fuzzy_params
+                if len(chromosome) >= fuzzy_end:
+                    fuzzy_params = chromosome[fuzzy_start:fuzzy_end]
+                else:
+                    logger.warning(f"Ind {i+1}: Chromosome too short for fuzzy params")
+            
+            # 4. Load Weights (accounting for fuzzy params)
+            weights_start = num_hyperparams + num_fuzzy_params
+            if len(chromosome) > weights_start:
+                weights_vector = chromosome[weights_start:]
                 load_weights_from_flat(current_model, weights_vector)
-            # else: only hyperparams evolved, use initial model weights (already set by ModelClass init)
+            # else: only hyperparams/fuzzy evolved, use initial model weights (already set by ModelClass init)
 
-            # 4. Evaluate
+            # 5. Evaluate Neural Network
             current_model.eval()
             with torch.no_grad():
                 # Call user's function: (model, device, config_dict)
                 # Ensure eval_config contains the device before calling
                 config_for_eval = {**eval_config, 'device': device} # Merge device into the config copy
-                fitness = task_eval_func(current_model, config_for_eval) # Pass model and combined config
+                nn_fitness = task_eval_func(current_model, config_for_eval) # Pass model and combined config
 
-            # Validate fitness value
-            if not isinstance(fitness, (float, int)):
-                logger.warning(f"Ind {i+1}: Fitness non-numeric ({type(fitness)}). Setting -inf.")
-                fitness = -float('inf')
-            elif not np.isfinite(fitness):
-                logger.warning(f"Ind {i+1}: Fitness non-finite ({fitness}). Setting -inf.")
-                fitness = -float('inf')
+            # Validate NN fitness value
+            if not isinstance(nn_fitness, (float, int)):
+                logger.warning(f"Ind {i+1}: Fitness non-numeric ({type(nn_fitness)}). Setting -inf.")
+                nn_fitness = -float('inf')
+            elif not np.isfinite(nn_fitness):
+                logger.warning(f"Ind {i+1}: Fitness non-finite ({nn_fitness}). Setting -inf.")
+                nn_fitness = -float('inf')
+            
+            # 6. Compute Fuzzy Fitness (if enabled)
+            if use_fuzzy and num_fuzzy_params > 0 and fuzzy_params is not None:
+                try:
+                    # Extract model-output-derived behavioral features
+                    # Use a sample forward pass to get behavioral features
+                    current_model.eval()
+                    with torch.no_grad():
+                        # Get sample input from eval_config if available
+                        sample_input = eval_config.get('sample_input', None)
+                        if sample_input is None:
+                            # Create dummy input based on model's expected input shape
+                            # This is a fallback - ideally eval_config should provide sample_input
+                            input_shape = eval_config.get('input_shape', (1, 28, 28))  # Default MNIST-like
+                            sample_input = torch.randn(input_shape).to(device)
+                        
+                        # Forward pass to get model output
+                        model_output = current_model(sample_input)
+                        
+                        # Extract behavioral features from model output
+                        # Use statistical features: mean, std, min, max, median
+                        output_np = model_output.cpu().numpy().flatten()
+                        features = [
+                            float(np.mean(output_np)),
+                            float(np.std(output_np)),
+                            float(np.min(output_np)),
+                            float(np.max(output_np)),
+                            float(np.median(output_np))
+                        ]
+                        
+                        # Pad or truncate to match num_inputs
+                        num_inputs = fuzzy_config.get("num_inputs", 3)
+                        if len(features) < num_inputs:
+                            # Pad with zeros
+                            features.extend([0.0] * (num_inputs - len(features)))
+                        else:
+                            # Truncate to num_inputs
+                            features = features[:num_inputs]
+                        
+                        # Normalize features to [0, 1] range
+                        features = np.array(features)
+                        if np.max(features) != np.min(features):
+                            features = (features - np.min(features)) / (np.max(features) - np.min(features))
+                        else:
+                            features = np.ones_like(features) * 0.5
+                        
+                        # Evaluate fuzzy system
+                        fuzzy_system = FuzzyInferenceSystem(fuzzy_config)
+                        fuzzy_fitness = fuzzy_system.evaluate(features, fuzzy_params)
+                        
+                        # Combine NN and fuzzy fitness
+                        alpha = fuzzy_config.get("alpha", 0.7)
+                        fitness = alpha * nn_fitness + (1 - alpha) * fuzzy_fitness
+                        
+                except Exception as fuzzy_err:
+                    logger.warning(f"Ind {i+1}: Fuzzy evaluation failed: {fuzzy_err}. Using NN fitness only.")
+                    fitness = nn_fitness
+            else:
+                # No fuzzy evaluation, use NN fitness only
+                fitness = nn_fitness
 
             fitness_scores[i] = float(fitness) # Store valid float or -inf
 
@@ -400,25 +481,29 @@ def select_parents_roulette(
 # --- Crossover Operators ---
 # MODIFIED: Accept num_hyperparams and operate separately
 
-def crossover_average(parent1: np.ndarray, parent2: np.ndarray, num_hyperparams: int) -> tuple[np.ndarray, np.ndarray]:
-    """ Average crossover for hyperparams and weights separately. """
+def crossover_average(parent1: np.ndarray, parent2: np.ndarray, num_hyperparams: int, num_fuzzy_params: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """ Average crossover for hyperparams, fuzzy params, and weights separately. """
     p1, p2 = np.asarray(parent1), np.asarray(parent2)
-    if p1.shape != p2.shape or len(p1) <= num_hyperparams:
+    weights_start = num_hyperparams + num_fuzzy_params
+    if p1.shape != p2.shape or len(p1) <= weights_start:
         logger.warning("Shape mismatch or insufficient length for average crossover. Returning copies.")
         return p1.copy(), p2.copy()
 
     # Average hyperparams
     h_child = (p1[:num_hyperparams] + p2[:num_hyperparams]) / 2.0 if num_hyperparams > 0 else np.array([])
+    # Average fuzzy params (as contiguous block)
+    f_child = (p1[num_hyperparams:weights_start] + p2[num_hyperparams:weights_start]) / 2.0 if num_fuzzy_params > 0 else np.array([])
     # Average weights
-    w_child = (p1[num_hyperparams:] + p2[num_hyperparams:]) / 2.0
+    w_child = (p1[weights_start:] + p2[weights_start:]) / 2.0
 
-    child = np.concatenate((h_child, w_child))
+    child = np.concatenate((h_child, f_child, w_child))
     return child.copy(), child.copy() # Returns two identical children
 
-def crossover_one_point(parent1: np.ndarray, parent2: np.ndarray, num_hyperparams: int) -> tuple[np.ndarray, np.ndarray]:
-    """ One-point crossover for hyperparams and weights separately. """
+def crossover_one_point(parent1: np.ndarray, parent2: np.ndarray, num_hyperparams: int, num_fuzzy_params: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """ One-point crossover for hyperparams, fuzzy params (as block), and weights separately. """
     p1, p2 = np.asarray(parent1), np.asarray(parent2)
-    if p1.shape != p2.shape or len(p1) <= num_hyperparams:
+    weights_start = num_hyperparams + num_fuzzy_params
+    if p1.shape != p2.shape or len(p1) <= weights_start:
         logger.warning("Shape mismatch/insufficient length for one-point crossover. Returning copies.")
         return p1.copy(), p2.copy()
 
@@ -432,25 +517,38 @@ def crossover_one_point(parent1: np.ndarray, parent2: np.ndarray, num_hyperparam
     else: # No hyperparams
         h1_new, h2_new = np.array([]), np.array([])
 
+    # Crossover Fuzzy Params (as contiguous block - swap entire block)
+    if num_fuzzy_params > 0:
+        # Randomly decide whether to swap fuzzy block
+        if random.random() < 0.5:
+            f1_new = p1[num_hyperparams:weights_start]
+            f2_new = p2[num_hyperparams:weights_start]
+        else:
+            f1_new = p2[num_hyperparams:weights_start]
+            f2_new = p1[num_hyperparams:weights_start]
+    else:
+        f1_new, f2_new = np.array([]), np.array([])
+
     # Crossover Weights
-    weight_size = len(p1) - num_hyperparams
+    weight_size = len(p1) - weights_start
     if weight_size > 1:
         wt_cross_pt = random.randint(1, weight_size - 1)
-        w1_new = np.concatenate((p1[num_hyperparams : num_hyperparams + wt_cross_pt], p2[num_hyperparams + wt_cross_pt :]))
-        w2_new = np.concatenate((p2[num_hyperparams : num_hyperparams + wt_cross_pt], p1[num_hyperparams + wt_cross_pt :]))
+        w1_new = np.concatenate((p1[weights_start : weights_start + wt_cross_pt], p2[weights_start + wt_cross_pt :]))
+        w2_new = np.concatenate((p2[weights_start : weights_start + wt_cross_pt], p1[weights_start + wt_cross_pt :]))
     elif weight_size == 1: # Swap single weight
-        w1_new, w2_new = p2[num_hyperparams:], p1[num_hyperparams:]
+        w1_new, w2_new = p2[weights_start:], p1[weights_start:]
     else: # No weights (unlikely)
         w1_new, w2_new = np.array([]), np.array([])
 
-    child1 = np.concatenate((h1_new, w1_new))
-    child2 = np.concatenate((h2_new, w2_new))
+    child1 = np.concatenate((h1_new, f1_new, w1_new))
+    child2 = np.concatenate((h2_new, f2_new, w2_new))
     return child1, child2
 
-def crossover_uniform(parent1: np.ndarray, parent2: np.ndarray, num_hyperparams: int, crossover_prob: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
-    """ Uniform Crossover for hyperparams and weights separately. """
+def crossover_uniform(parent1: np.ndarray, parent2: np.ndarray, num_hyperparams: int, crossover_prob: float = 0.5, num_fuzzy_params: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """ Uniform Crossover for hyperparams, fuzzy params (as block), and weights separately. """
     p1, p2 = np.asarray(parent1), np.asarray(parent2)
-    if p1.shape != p2.shape or len(p1) <= num_hyperparams:
+    weights_start = num_hyperparams + num_fuzzy_params
+    if p1.shape != p2.shape or len(p1) <= weights_start:
         logger.warning("Shape mismatch/insufficient length for uniform crossover. Returning copies.")
         return p1.copy(), p2.copy()
 
@@ -461,16 +559,27 @@ def crossover_uniform(parent1: np.ndarray, parent2: np.ndarray, num_hyperparams:
         h1_new = np.where(hp_swap_mask, p2[:num_hyperparams], p1[:num_hyperparams])
         h2_new = np.where(hp_swap_mask, p1[:num_hyperparams], p2[:num_hyperparams])
 
+    # Crossover Fuzzy Params (as contiguous block - swap entire block based on probability)
+    if num_fuzzy_params > 0:
+        if random.random() < crossover_prob:
+            f1_new = p2[num_hyperparams:weights_start]
+            f2_new = p1[num_hyperparams:weights_start]
+        else:
+            f1_new = p1[num_hyperparams:weights_start]
+            f2_new = p2[num_hyperparams:weights_start]
+    else:
+        f1_new, f2_new = np.array([]), np.array([])
+
     # Crossover Weights
-    w1_new, w2_new = p1[num_hyperparams:], p2[num_hyperparams:]
+    w1_new, w2_new = p1[weights_start:], p2[weights_start:]
     weight_size = len(w1_new)
     if weight_size > 0:
         wt_swap_mask = np.random.rand(weight_size) < crossover_prob
-        w1_new = np.where(wt_swap_mask, p2[num_hyperparams:], p1[num_hyperparams:])
-        w2_new = np.where(wt_swap_mask, p1[num_hyperparams:], p2[num_hyperparams:])
+        w1_new = np.where(wt_swap_mask, p2[weights_start:], p1[weights_start:])
+        w2_new = np.where(wt_swap_mask, p1[weights_start:], p2[weights_start:])
 
-    child1 = np.concatenate((h1_new, w1_new))
-    child2 = np.concatenate((h2_new, w2_new))
+    child1 = np.concatenate((h1_new, f1_new, w1_new))
+    child2 = np.concatenate((h2_new, f2_new, w2_new))
     return child1, child2
 
 
@@ -499,14 +608,16 @@ def mutate_weights_gaussian(
     chromosome: np.ndarray,
     current_mutation_rate: float, # Use rate passed from task
     mutation_strength: float,
-    num_hyperparams: int
+    num_hyperparams: int,
+    num_fuzzy_params: int = 0
 ) -> np.ndarray:
     """ Adds Gaussian noise to a fraction of weights based on current mutation rate. """
-    if current_mutation_rate <= 0 or mutation_strength <= 0 or len(chromosome) <= num_hyperparams:
+    weights_start = num_hyperparams + num_fuzzy_params
+    if current_mutation_rate <= 0 or mutation_strength <= 0 or len(chromosome) <= weights_start:
         return chromosome # Return unchanged if no mutation needed or no weights
 
     mutated_chromosome = chromosome.copy()
-    weights = mutated_chromosome[num_hyperparams:] # Get view/copy of weights
+    weights = mutated_chromosome[weights_start:] # Get view/copy of weights
     num_weights = weights.size
     if num_weights == 0: return chromosome
 
@@ -520,21 +631,23 @@ def mutate_weights_gaussian(
         weights[indices_to_mutate] += noise # Mutate weights in place
 
     # No need to re-concatenate if 'weights' was a view, but copy ensures safety
-    mutated_chromosome[num_hyperparams:] = weights
+    mutated_chromosome[weights_start:] = weights
     return mutated_chromosome
 
 def mutate_weights_uniform_random(
     chromosome: np.ndarray,
     current_mutation_rate: float, # Use rate passed from task
     value_range: Tuple[float, float],
-    num_hyperparams: int
+    num_hyperparams: int,
+    num_fuzzy_params: int = 0
 ) -> np.ndarray:
     """ Mutates weights by replacing selected genes with a new random value. """
-    if current_mutation_rate <= 0 or len(chromosome) <= num_hyperparams:
+    weights_start = num_hyperparams + num_fuzzy_params
+    if current_mutation_rate <= 0 or len(chromosome) <= weights_start:
         return chromosome
 
     mutated_chromosome = chromosome.copy()
-    weights = mutated_chromosome[num_hyperparams:]
+    weights = mutated_chromosome[weights_start:]
     num_weights = weights.size
     if num_weights == 0: return chromosome
 
@@ -546,7 +659,7 @@ def mutate_weights_uniform_random(
         new_values = np.random.uniform(min_val, max_val, size=num_mutations).astype(weights.dtype)
         weights[mutation_mask] = new_values # Replace weights in place
 
-    mutated_chromosome[num_hyperparams:] = weights
+    mutated_chromosome[weights_start:] = weights
     return mutated_chromosome
 
 # --- End of Helper Functions ---

@@ -19,6 +19,7 @@ interface TaskResultData {
     diversity_history?: number[] | null;
     // Added based on task return values
     best_hyperparameters?: Record<string, any> | null;
+    best_fuzzy_parameters?: Record<string, any> | null;
     status?: string; // Could be included in result/meta, e.g., HALTED_BY_USER
 }
 

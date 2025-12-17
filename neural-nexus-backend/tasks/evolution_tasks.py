@@ -31,6 +31,9 @@ from app.utils.evolution_helpers import (
     mutate_weights_gaussian,
     mutate_weights_uniform_random
 )
+# --- Import fuzzy components ---
+from app.core.fuzzy import FuzzyInferenceSystem
+from app.utils.fuzzy_helpers import init_fuzzy_genome, decode_fuzzy_params, mutate_fuzzy_params
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +42,12 @@ RESULT_DIR = settings.RESULT_DIR
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 # --- Helper Function for Diversity (Modified) ---
-def calculate_population_diversity(population: list[np.ndarray], num_hyperparams: int) -> float:
+def calculate_population_diversity(population: list[np.ndarray], num_hyperparams: int, num_fuzzy_params: int = 0) -> float:
     """Calculates average pairwise Euclidean distance between the weight vectors."""
-    if not population or len(population) < 2 or num_hyperparams < 0: return 0.0
+    weights_start = num_hyperparams + num_fuzzy_params
+    if not population or len(population) < 2 or weights_start < 0: return 0.0
     num_individuals = len(population)
-    weight_vectors = [ind[num_hyperparams:] for ind in population if isinstance(ind, np.ndarray) and len(ind) > num_hyperparams]
+    weight_vectors = [ind[weights_start:] for ind in population if isinstance(ind, np.ndarray) and len(ind) > weights_start]
     if len(weight_vectors) < 2: return 0.0
     flat_weights = [w.flatten() for w in weight_vectors]
     if len(flat_weights) < 2: return 0.0
@@ -206,6 +210,15 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
 
         logger.info(f"[Task {task_id}] Using device: {device}")
         if device.type == 'cuda': logger.info(f"[Task {task_id}] CUDA Device Name: {torch.cuda.get_device_name(0)}")
+        # --- Fuzzy Config Extraction ---
+        use_fuzzy = config.get("use_fuzzy", False)
+        fuzzy_config = config.get("fuzzy_config", {})
+        if use_fuzzy:
+            fuzzy_config.setdefault("alpha", 0.7)
+            logger.info(f"[Task {task_id}] Fuzzy co-evolution enabled: {fuzzy_config}")
+        else:
+            logger.info(f"[Task {task_id}] Fuzzy co-evolution disabled (NN-only)")
+        
         logger.info(f"[Task {task_id}] Config Summary: Gens={generations}, Pop={population_size}, Elitism={elitism_count}")
         logger.info(f"[Task {task_id}] Operators: Select='{selection_strategy}', Cross='{crossover_operator}', Mut(W)='{mutation_operator}'")
         if use_dynamic_mutation_rate: logger.info(f"[Task {task_id}] Dynamic Rate(W) Enabled: H='{dynamic_mutation_heuristic}'")
@@ -241,7 +254,17 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
         if initial_weights.size == 0:
             raise ValueError("Initial weight vector size is zero. Cannot proceed.")
 
-        # 3. Generate initial population chromosomes
+        # 3. Initialize fuzzy genome (if enabled)
+        fuzzy_genome_template = None
+        num_fuzzy_params = 0
+        if use_fuzzy:
+            fuzzy_genome_template = init_fuzzy_genome(fuzzy_config)
+            num_fuzzy_params = len(fuzzy_genome_template)
+            logger.info(f"[Task {task_id}] Initialized fuzzy genome with {num_fuzzy_params} parameters")
+        else:
+            fuzzy_genome_template = np.array([], dtype=np.float64)
+        
+        # 4. Generate initial population chromosomes
         population: List[np.ndarray] = []
         init_rate_for_spread = initial_mutation_rate if use_dynamic_mutation_rate else mutation_rate # Use initial rate if dynamic for spread
         for i in range(population_size):
@@ -252,18 +275,34 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
                  h_min, h_max = h_config.get('range', [0.0, 1.0])
                  hyperparam_values[idx] = random.uniform(h_min, h_max)
 
+            # Generate fuzzy genome (copy template, optionally mutate for diversity)
+            if use_fuzzy and num_fuzzy_params > 0:
+                if i == 0:
+                    fuzzy_genome = fuzzy_genome_template.copy()
+                else:
+                    # Slight mutation for diversity
+                    fuzzy_genome = mutate_fuzzy_params(
+                        np.concatenate((np.zeros(num_hyperparams), fuzzy_genome_template)),
+                        num_hyperparams,
+                        num_fuzzy_params,
+                        mutation_rate=0.1,
+                        mutation_strength=0.01
+                    )[num_hyperparams:]
+            else:
+                fuzzy_genome = np.array([], dtype=np.float64)
+
             # Generate initial weights (copy or mutated copy)
             if i == 0: # First individual keeps initial weights
                  individual_weights = initial_weights.copy()
             else: # Mutate initial weights for diversity
                  if mutation_operator == "gaussian":
-                     individual_weights = mutate_weights_gaussian(initial_weights, init_rate_for_spread, mutation_strength, num_hyperparams=0)
+                     individual_weights = mutate_weights_gaussian(initial_weights, init_rate_for_spread, mutation_strength, num_hyperparams=0, num_fuzzy_params=0)
                  elif mutation_operator == "uniform_random":
-                     individual_weights = mutate_weights_uniform_random(initial_weights, init_rate_for_spread, uniform_mutation_range, num_hyperparams=0)
+                     individual_weights = mutate_weights_uniform_random(initial_weights, init_rate_for_spread, uniform_mutation_range, num_hyperparams=0, num_fuzzy_params=0)
                  else:
-                     individual_weights = mutate_weights_gaussian(initial_weights, init_rate_for_spread, mutation_strength, num_hyperparams=0)
+                     individual_weights = mutate_weights_gaussian(initial_weights, init_rate_for_spread, mutation_strength, num_hyperparams=0, num_fuzzy_params=0)
 
-            chromosome = np.concatenate((hyperparam_values, individual_weights))
+            chromosome = np.concatenate((hyperparam_values, fuzzy_genome, individual_weights))
             population.append(chromosome)
 
         if device.type == 'cuda': torch.cuda.empty_cache()
@@ -334,7 +373,10 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
                     population, model_definition_path, model_class, task_eval_func, device,
                     model_args, model_kwargs_static, eval_config,
                     num_hyperparams=num_hyperparams,
-                    evolvable_hyperparams_config=evolvable_hyperparams_config
+                    evolvable_hyperparams_config=evolvable_hyperparams_config,
+                    use_fuzzy=use_fuzzy,
+                    num_fuzzy_params=num_fuzzy_params,
+                    fuzzy_config=fuzzy_config
                 )
                 fitness_scores = [float(f) if f is not None and np.isfinite(f) else -float('inf') for f in fitness_scores]
 
@@ -351,7 +393,7 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
 
             max_fitness = np.max(valid_scores)
             avg_fitness = np.mean(valid_scores) # Current average fitness
-            diversity = calculate_population_diversity(population, num_hyperparams)
+            diversity = calculate_population_diversity(population, num_hyperparams, num_fuzzy_params)
             fitness_history_overall.append(float(max_fitness))
             avg_fitness_history_overall.append(float(avg_fitness))
             diversity_history_overall.append(float(diversity))
@@ -445,7 +487,12 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
                 for _ in range(population_size - 1):
                     # Mutate based on rate calculated for *this* reproduction step
                     mutated_best_h = mutate_hyperparams_gaussian(best_chromosome_overall, hyperparam_mutation_strength, num_hyperparams)
-                    mutated_best_w = mutate_weights_gaussian(mutated_best_h, current_mutation_rate, mutation_strength, num_hyperparams)
+                    # Mutate fuzzy params if enabled
+                    if use_fuzzy and num_fuzzy_params > 0:
+                        mutated_best_f = mutate_fuzzy_params(mutated_best_h, num_hyperparams, num_fuzzy_params, mutation_rate, mutation_strength)
+                    else:
+                        mutated_best_f = mutated_best_h
+                    mutated_best_w = mutate_weights_gaussian(mutated_best_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
                     next_population.append(mutated_best_w)
                 population = next_population[:population_size]
                 continue
@@ -469,26 +516,34 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
 
                     # Crossover
                     child1_chrom, child2_chrom = None, None
-                    if crossover_operator == "one_point": child1_chrom, child2_chrom = crossover_one_point(p1_chrom, p2_chrom, num_hyperparams)
-                    elif crossover_operator == "uniform": child1_chrom, child2_chrom = crossover_uniform(p1_chrom, p2_chrom, num_hyperparams, crossover_prob=uniform_crossover_prob)
-                    elif crossover_operator == "average": child1_chrom, child2_chrom = crossover_average(p1_chrom, p2_chrom, num_hyperparams)
-                    else: child1_chrom, child2_chrom = crossover_one_point(p1_chrom, p2_chrom, num_hyperparams) # Default
+                    if crossover_operator == "one_point": child1_chrom, child2_chrom = crossover_one_point(p1_chrom, p2_chrom, num_hyperparams, num_fuzzy_params)
+                    elif crossover_operator == "uniform": child1_chrom, child2_chrom = crossover_uniform(p1_chrom, p2_chrom, num_hyperparams, crossover_prob=uniform_crossover_prob, num_fuzzy_params=num_fuzzy_params)
+                    elif crossover_operator == "average": child1_chrom, child2_chrom = crossover_average(p1_chrom, p2_chrom, num_hyperparams, num_fuzzy_params)
+                    else: child1_chrom, child2_chrom = crossover_one_point(p1_chrom, p2_chrom, num_hyperparams, num_fuzzy_params) # Default
 
                     # Mutation (using rate determined before reproduction)
                     # 1. Mutate Hyperparams
                     mutated_child1_h = mutate_hyperparams_gaussian(child1_chrom, hyperparam_mutation_strength, num_hyperparams)
                     mutated_child2_h = mutate_hyperparams_gaussian(child2_chrom, hyperparam_mutation_strength, num_hyperparams)
-                    # 2. Mutate Weights
+                    # 2. Mutate Fuzzy Params
+                    if use_fuzzy and num_fuzzy_params > 0:
+                        fuzzy_start = num_hyperparams
+                        mutated_child1_f = mutate_fuzzy_params(mutated_child1_h, fuzzy_start, num_fuzzy_params, mutation_rate, mutation_strength)
+                        mutated_child2_f = mutate_fuzzy_params(mutated_child2_h, fuzzy_start, num_fuzzy_params, mutation_rate, mutation_strength)
+                    else:
+                        mutated_child1_f = mutated_child1_h
+                        mutated_child2_f = mutated_child2_h
+                    # 3. Mutate Weights
                     mutated_child1_w, mutated_child2_w = None, None
                     if mutation_operator == "gaussian":
-                        mutated_child1_w = mutate_weights_gaussian(mutated_child1_h, current_mutation_rate, mutation_strength, num_hyperparams)
-                        mutated_child2_w = mutate_weights_gaussian(mutated_child2_h, current_mutation_rate, mutation_strength, num_hyperparams)
+                        mutated_child1_w = mutate_weights_gaussian(mutated_child1_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
+                        mutated_child2_w = mutate_weights_gaussian(mutated_child2_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
                     elif mutation_operator == "uniform_random":
-                        mutated_child1_w = mutate_weights_uniform_random(mutated_child1_h, current_mutation_rate, uniform_mutation_range, num_hyperparams)
-                        mutated_child2_w = mutate_weights_uniform_random(mutated_child2_h, current_mutation_rate, uniform_mutation_range, num_hyperparams)
+                        mutated_child1_w = mutate_weights_uniform_random(mutated_child1_f, current_mutation_rate, uniform_mutation_range, num_hyperparams, num_fuzzy_params)
+                        mutated_child2_w = mutate_weights_uniform_random(mutated_child2_f, current_mutation_rate, uniform_mutation_range, num_hyperparams, num_fuzzy_params)
                     else: # Default
-                        mutated_child1_w = mutate_weights_gaussian(mutated_child1_h, current_mutation_rate, mutation_strength, num_hyperparams)
-                        mutated_child2_w = mutate_weights_gaussian(mutated_child2_h, current_mutation_rate, mutation_strength, num_hyperparams)
+                        mutated_child1_w = mutate_weights_gaussian(mutated_child1_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
+                        mutated_child2_w = mutate_weights_gaussian(mutated_child2_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
 
                     if len(next_population) < population_size: next_population.append(mutated_child1_w)
                     if len(next_population) < population_size: next_population.append(mutated_child2_w)
@@ -498,7 +553,12 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
                      if len(next_population) < population_size:
                           substitute_parent_chrom = random.choice(parents) if parents else best_chromosome_overall
                           mut_sub_h = mutate_hyperparams_gaussian(substitute_parent_chrom, hyperparam_mutation_strength, num_hyperparams)
-                          mut_sub_w = mutate_weights_gaussian(mut_sub_h, current_mutation_rate, mutation_strength, num_hyperparams) # Use current rate
+                          # Mutate fuzzy params if enabled
+                          if use_fuzzy and num_fuzzy_params > 0:
+                              mut_sub_f = mutate_fuzzy_params(mut_sub_h, num_hyperparams, num_fuzzy_params, mutation_rate, mutation_strength)
+                          else:
+                              mut_sub_f = mut_sub_h
+                          mut_sub_w = mutate_weights_gaussian(mut_sub_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params) # Use current rate
                           next_population.append(mut_sub_w)
 
             population = next_population[:population_size]
@@ -518,7 +578,7 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
             model_definition_path, model_class, None, device,
             *model_args, **model_kwargs_static, **best_hyperparams
         )
-        best_weights = best_chromosome_overall[num_hyperparams:]
+        best_weights = best_chromosome_overall[num_hyperparams + num_fuzzy_params:]
         load_weights_from_flat(final_best_model, best_weights)
         torch.save(final_best_model.state_dict(), final_model_path)
         logger.info(f"[Task {task_id}] Best model saved successfully.")
@@ -531,6 +591,20 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
                   try: os.remove(f_path); logger.debug(f"Removed: {f_path}")
                   except OSError as rm_err: logger.warning(f"Could not remove {f_path}: {rm_err}")
 
+        # --- Extract best fuzzy parameters (if enabled) ---
+        best_fuzzy_params = None
+        if use_fuzzy and num_fuzzy_params > 0:
+            try:
+                fuzzy_start = num_hyperparams
+                fuzzy_params_array = best_chromosome_overall[fuzzy_start:fuzzy_start + num_fuzzy_params]
+                best_fuzzy_params = {
+                    'params': fuzzy_params_array.tolist(),
+                    'num_params': num_fuzzy_params
+                }
+                logger.info(f"[Task {task_id}] Best fuzzy parameters extracted ({num_fuzzy_params} params)")
+            except Exception as fuzzy_err:
+                logger.warning(f"[Task {task_id}] Failed to extract best fuzzy params: {fuzzy_err}")
+        
         # --- Return final result data ---
         success_message = f'Evolution completed. Best fitness: {best_fitness_overall:.4f}.'
         final_result = {
@@ -538,6 +612,7 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
             'final_model_path': final_model_path,
             'best_fitness': float(best_fitness_overall),
             'best_hyperparameters': best_hyperparams,
+            'best_fuzzy_parameters': best_fuzzy_params,
             'fitness_history': fitness_history_overall,
             'avg_fitness_history': avg_fitness_history_overall,
             'diversity_history': diversity_history_overall
