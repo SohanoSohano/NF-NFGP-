@@ -119,13 +119,16 @@ def decode_hyperparameters(
 def load_pytorch_model(
     model_definition_path: str,
     class_name: str,
-    state_dict_path: str | None,
-    device: torch.device,
+    state_dict_path: str | None = None,
+    device: torch.device | None = None,
     *model_args_static: Any, # Renamed for clarity
     **model_kwargs_combined: Any # Receives static + dynamic kwargs merged
 ) -> nn.Module:
     """ Loads the model class, instantiates it with combined kwargs, and loads state_dict if provided. """
     try:
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         norm_model_path = os.path.normpath(model_definition_path)
         if not os.path.exists(norm_model_path):
              raise FileNotFoundError(f"Model definition file not found at {norm_model_path}")
@@ -166,7 +169,7 @@ def load_pytorch_model(
         # else: logger.info("No state_dict path provided, using model init weights.") # Less verbose
 
         model.eval()
-        return model
+        return ModelClass, model
     except Exception as e:
         logger.error(f"Error in load_pytorch_model: {e}", exc_info=True)
         raise

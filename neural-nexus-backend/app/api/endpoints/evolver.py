@@ -164,8 +164,8 @@ async def start_evolution(
         task = run_evolution_task.delay(
             model_definition_path=model_def_path,
             task_evaluation_path=eval_path,
-            use_standard_eval=use_standard_eval,
-            initial_weights_path=weights_path,
+            #use_standard_eval=use_standard_eval,
+            #initial_weights_path=weights_path,       ERROR AFTER MERGE
             config=config_to_send # Send the validated dict
         )
         logger.info(f"Task dispatched with ID: {task.id}")

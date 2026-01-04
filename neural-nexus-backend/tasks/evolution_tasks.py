@@ -129,13 +129,24 @@ def run_evolution_task(self, model_definition_path, task_evaluation_path, config
     num_hparams = len(config.get('evolvable_hyperparams_config', {}))
     num_fuzzy_params = config.get('num_fuzzy_params', 10) # Number of membership/rule genes
     
+
+    # Extract model initialization parameters from config
+    model_args_static = config.get('model_args', [])  # Positional args for model __init__
+    model_kwargs_static = config.get('model_kwargs', {})  # Static kwargs
+    evolved_kwargs = {}  # Will be populated by evolution engine later
+
+    # Combine static and evolved hyperparameters
+    model_kwargs_combined = {**model_kwargs_static, **evolved_kwargs}
+
+
     # Load Core Assets
-    model_class = load_pytorch_model(model_definition_path, config.get('model_class'))
+    ModelClass, initial_model = load_pytorch_model(model_definition_path, config.get('model_class'))
     task_eval_func = load_task_eval_function(task_evaluation_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Determine total chromosome length
-    sample_model = model_class()
+    sample_model = model = ModelClass(*model_args_static, **model_kwargs_combined)
+    sample_model.to(device)
     num_weights = sum(p.numel() for p in sample_model.parameters() if p.requires_grad)
     total_gene_count = num_hparams + num_fuzzy_params + num_weights
     
@@ -159,7 +170,9 @@ def run_evolution_task(self, model_definition_path, task_evaluation_path, config
                 fuzzy_genes = chromosome[num_hparams : num_hparams + num_fuzzy_params]
                 weight_genes = chromosome[num_hparams + num_fuzzy_params :]
                 
-                model = model_class()
+                
+                model = ModelClass(*model_args_static, **model_kwargs_combined)
+                model.to(device)
                 load_weights_from_flat(model, weight_genes)
                 
                 # Evaluation returns: [Accuracy, Confidence, -Latency]
@@ -214,14 +227,19 @@ def run_evolution_task(self, model_definition_path, task_evaluation_path, config
             # 2. Selection & Crossover (Section 1.1)
             num_to_breed = pop_size - len(next_population)
             parents = select_parents_nsga2(population, ranks, distances, num_to_breed)
-
+            
+            evolved_hparam_keys = list(config.get('hyperparameters', {}).keys())
+            num_hyperparams = len(evolved_hparam_keys)
+            num_fuzzy_params = config.get('num_fuzzy_params', 10)
+            
+            # Crossover and Mutation
             for i in range(0, len(parents), 2):
                 if i + 1 < len(parents):
-                    child1, child2 = crossover_uniform(parents[i], parents[i+1])
+                    child1, child2 = crossover_uniform(parents[i], parents[i+1], num_hyperparams)
                     
                     # 3. Mutation (Section 1.2 & 2.2)
                     # Gaussian mutation for both model weights and fuzzy rules
-                    child1 = mutate_weights_gaussian(child1, config.get('mutation_rate', 0.1), config.get('mutation_strength', 0.05), 0)
+                    child1 = mutate_weights_gaussian(child1, config.get('mutation_rate', 0.1), config.get('mutation_strength', 0.05), num_hyperparams)
                     child2 = mutate_weights_gaussian(child2, config.get('mutation_rate', 0.1), config.get('mutation_strength', 0.05), 0)
                     
                     next_population.extend([child1, child2])
@@ -236,7 +254,8 @@ def run_evolution_task(self, model_definition_path, task_evaluation_path, config
         best_chromosome = population[best_idx]
         
         save_path = os.path.join(settings.RESULT_DIR, f"final_model_{task_id}.pth")
-        final_model = model_class()
+        final_model = ModelClass(*model_args_static, **model_kwargs_combined)
+        final_model.to(device)
         load_weights_from_flat(final_model, best_chromosome[num_hparams + num_fuzzy_params:])
         torch.save(final_model.state_dict(), save_path)
 
